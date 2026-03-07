@@ -8,6 +8,7 @@ DONT_START=no
 OVERWRITE=no
 PREVIEW=no
 REDASH_VERSION=""
+COMPOSE_WRAPPER_DEFINED=no
 
 # Ensure the script is being run as root
 ID=$(id -u)
@@ -18,28 +19,37 @@ fi
 
 # Ensure the 'docker' and 'docker-compose' commands are available
 # and if not, ensure the script can install them
+# Also detect which Docker Compose command to use and create wrapper function
 SKIP_DOCKER_INSTALL=no
-if [ -x "$(command -v docker)" ]; then
-	# The first condition is 'docker-compose (v1)' and the second is 'docker compose (v2)'.
-	if [ -x "$(command -v docker-compose)" ] || (docker compose 1>/dev/null 2>&1 && [ $? -eq 0 ]); then
-		SKIP_DOCKER_INSTALL=yes
-	fi
-elif [ ! -f /etc/os-release ]; then
-	echo "Unknown Linux distribution.  This script presently works only on Debian, Fedora, Ubuntu, and RHEL (and compatible)"
-	exit
-fi
 
-# Detect the correct Docker Compose command
-detect_compose_command() {
+# Detect and define docker_compose wrapper function at global scope
+detect_and_define_compose() {
+	if [ "$COMPOSE_WRAPPER_DEFINED" = "yes" ]; then
+		return 0
+	fi
+	
 	if docker compose version >/dev/null 2>&1; then
-		DOCKER_COMPOSE="docker compose"
+		docker_compose() { docker compose "$@"; }
+		COMPOSE_WRAPPER_DEFINED=yes
 	elif command -v docker-compose >/dev/null 2>&1; then
-		DOCKER_COMPOSE="docker-compose"
+		docker_compose() { docker-compose "$@"; }
+		COMPOSE_WRAPPER_DEFINED=yes
 	else
-		echo "Error: Neither 'docker compose' nor 'docker-compose' found."
-		exit 1
+		echo "Error: Neither 'docker compose' nor 'docker-compose' found." >&2
+		return 1
 	fi
 }
+
+if command -v docker >/dev/null 2>&1; then
+	# Docker is already installed, detect which compose command to use
+	if detect_and_define_compose; then
+		SKIP_DOCKER_INSTALL=yes
+	fi
+	# If Compose not found, continue to install docker-compose-plugin
+elif [ ! -f /etc/os-release ]; then
+	echo "Unknown Linux distribution.  This script presently works only on Debian, Fedora, Ubuntu, and RHEL (and compatible)"
+	exit 1
+fi
 
 # Parse any user provided parameters
 opts="$(getopt -o doph -l dont-start,overwrite,preview,help,version: --name "$0" -- "$@")"
@@ -185,7 +195,7 @@ create_directories() {
 			# We've been asked to overwrite the existing database
 			echo "Shutting down any running Redash instance"
 			if [ -e "$REDASH_BASE_PATH"/compose.yaml ]; then
-				$DOCKER_COMPOSE -f "$REDASH_BASE_PATH"/compose.yaml down
+				docker_compose -f "$REDASH_BASE_PATH"/compose.yaml down
 			fi
 
 			echo "Moving old Redash PG database directory out of the way"
@@ -325,10 +335,10 @@ startup() {
 		echo "** Starting Redash **"
 		echo "*********************"
 		echo "** Initialising Redash database **"
-		$DOCKER_COMPOSE run --rm server create_db
+		docker_compose run --rm server create_db
 
 		echo "** Starting the rest of Redash **"
-		$DOCKER_COMPOSE up -d
+		docker_compose up -d
 
 		echo
 		echo "Redash has been installed and is ready for configuring at http://$(hostname -f):5000"
@@ -378,9 +388,9 @@ else
 	esac
 fi
 
-# Detect the right Docker Compose command to use
-detect_compose_command
-echo "Using compose command: $DOCKER_COMPOSE"
+# Detect the right Docker Compose command to use (after Docker installation if needed)
+detect_and_define_compose
+echo "Using compose command: $(docker_compose version | head -n1)"
 
 # Ensure pwgen is available (needed for generating secrets)
 if ! command -v pwgen >/dev/null 2>&1; then
