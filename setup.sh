@@ -1,6 +1,7 @@
 #!/usr/bin/env sh
 
-# This script sets up dockerized Redash on Debian 12.x, Fedora 38 or later, Ubuntu LTS 20.04 & 22.04, and RHEL (and compatible) 8.x & 9.x
+# This script sets up dockerized Redash on Debian 12.x, Fedora 38 or later, Ubuntu LTS 20.04 & 22.04,
+# RHEL (and compatible) 8.x & 9.x, and Amazon Linux 2 / 2023
 set -eu
 
 REDASH_BASE_PATH=/opt/redash
@@ -9,6 +10,11 @@ OVERWRITE=no
 PREVIEW=no
 REDASH_VERSION=""
 COMPOSE_WRAPPER_DEFINED=no
+
+# Pinned Docker Compose v2 version used when we have to install the CLI plugin
+# manually (Amazon Linux 2). Bump deliberately; verify the SHA256 from the
+# release page when you do.
+COMPOSE_PLUGIN_VERSION="v2.29.7"
 
 # Ensure the script is being run as root
 ID=$(id -u)
@@ -47,7 +53,7 @@ if command -v docker >/dev/null 2>&1; then
 	fi
 	# If Compose not found, continue to install docker-compose-plugin
 elif [ ! -f /etc/os-release ]; then
-	echo "Unknown Linux distribution.  This script presently works only on Debian, Fedora, Ubuntu, and RHEL (and compatible)"
+	echo "Unknown Linux distribution.  This script presently works only on Debian, Fedora, Ubuntu, RHEL (and compatible), and Amazon Linux"
 	exit 1
 fi
 
@@ -123,6 +129,59 @@ install_docker_fedora() {
 
 	# Install Docker
 	dnf install -qy docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin pwgen
+
+	# Start Docker and enable it for automatic start at boot
+	systemctl start docker && systemctl enable docker
+}
+
+install_docker_amazon_linux_2() {
+	echo "** Installing Docker (Amazon Linux 2) **"
+
+	# AL2 ships Docker via amazon-linux-extras, NOT via Docker's upstream repos.
+	# The upstream docker-ce CentOS/RHEL repo does not provide AL2-compatible
+	# packages, so we use Amazon's curated topic instead.
+
+	# Enable EPEL for pwgen (not in the default AL2 repos)
+	amazon-linux-extras install -y epel
+
+	# Enable the docker topic and install
+	amazon-linux-extras enable docker
+	yum clean metadata
+	yum install -y docker pwgen
+
+	# AL2's docker package does NOT bundle the Compose v2 plugin, and there is
+	# no official AL2 docker-compose-plugin RPM. Install the static binary as a
+	# CLI plugin so `docker compose ...` works the same as on every other distro.
+	#
+	# SECURITY NOTE: this downloads a release binary over HTTPS without
+	# verifying a checksum. If you care (you should), pin a known-good SHA256
+	# below and uncomment the verification block. Checksums are published at
+	# https://github.com/docker/compose/releases
+	ARCH_RAW=$(uname -m)
+	case "$ARCH_RAW" in
+		x86_64)  COMPOSE_ARCH="x86_64" ;;
+		aarch64) COMPOSE_ARCH="aarch64" ;;
+		*)
+			echo "Unsupported architecture for Compose plugin install: $ARCH_RAW" >&2
+			exit 1
+			;;
+	esac
+
+	# /usr/libexec/docker/cli-plugins is the system-wide plugin path that the
+	# AL2 docker package's CLI searches. Using /usr/local/lib/docker/cli-plugins
+	# also works on most distros but is NOT picked up by AL2's docker build.
+	PLUGIN_DIR=/usr/libexec/docker/cli-plugins
+	mkdir -p "$PLUGIN_DIR"
+	curl -fsSL \
+		"https://github.com/docker/compose/releases/download/${COMPOSE_PLUGIN_VERSION}/docker-compose-linux-${COMPOSE_ARCH}" \
+		-o "$PLUGIN_DIR/docker-compose"
+	chmod 0755 "$PLUGIN_DIR/docker-compose"
+
+	# Optional integrity check — fill in the expected SHA256 for your pinned
+	# version + arch and uncomment to enforce.
+	#
+	# EXPECTED_SHA256="<paste sha256 here>"
+	# echo "${EXPECTED_SHA256}  ${PLUGIN_DIR}/docker-compose" | sha256sum -c -
 
 	# Start Docker and enable it for automatic start at boot
 	systemctl start docker && systemctl enable docker
@@ -368,8 +427,28 @@ else
 	debian)
 		install_docker_debian
 		;;
-	fedora | amzn)
+	fedora)
 		install_docker_fedora
+		;;
+	amzn)
+		# Amazon Linux 2 and Amazon Linux 2023 are very different beasts:
+		#   - AL2   uses amazon-linux-extras + an old kernel/glibc, no upstream
+		#           docker-ce repo, no compose plugin RPM.
+		#   - AL2023 is dnf-based and Fedora-ish; the Fedora installer works.
+		AMZN_VER=$(. /etc/os-release && echo "$VERSION_ID")
+		case "$AMZN_VER" in
+		2)
+			PROFILE=.bashrc
+			install_docker_amazon_linux_2
+			;;
+		2023)
+			install_docker_fedora
+			;;
+		*)
+			echo "Unsupported Amazon Linux version: $AMZN_VER"
+			exit 1
+			;;
+		esac
 		;;
 	ubuntu)
 		install_docker_ubuntu
@@ -379,7 +458,7 @@ else
 		install_docker_rhel
 		;;
 	*)
-		echo "This doesn't seem to be a Debian, Fedora, Ubuntu, nor RHEL (compatible) system, so this script doesn't know how to add Docker to it."
+		echo "This doesn't seem to be a Debian, Fedora, Ubuntu, RHEL (compatible), nor Amazon Linux system, so this script doesn't know how to add Docker to it."
 		echo
 		echo "Please contact the Redash project via GitHub and ask about getting support added, or add it yourself and let us know. :)"
 		echo
@@ -398,9 +477,13 @@ if ! command -v pwgen >/dev/null 2>&1; then
 	if [ -f /etc/debian_version ]; then
 		apt-get update -qq
 		apt-get install -y pwgen
-	elif [ -f /etc/redhat-release ]; then
+	elif [ -f /etc/redhat-release ] || [ -f /etc/system-release ]; then
+		# /etc/system-release covers Amazon Linux, which lacks /etc/redhat-release
 		if command -v dnf >/dev/null 2>&1; then
 			dnf install -y pwgen
+		elif command -v amazon-linux-extras >/dev/null 2>&1; then
+			amazon-linux-extras install -y epel
+			yum install -y pwgen
 		else
 			yum install -y pwgen
 		fi
