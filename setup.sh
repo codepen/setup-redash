@@ -27,7 +27,7 @@ detect_and_define_compose() {
 	if [ "$COMPOSE_WRAPPER_DEFINED" = "yes" ]; then
 		return 0
 	fi
-	
+
 	if docker compose version >/dev/null 2>&1; then
 		docker_compose() { docker compose "$@"; }
 		COMPOSE_WRAPPER_DEFINED=yes
@@ -368,7 +368,7 @@ else
 	debian)
 		install_docker_debian
 		;;
-	fedora)
+	fedora | amzn)
 		install_docker_fedora
 		;;
 	ubuntu)
